@@ -162,11 +162,36 @@ func (s *Store) List(box string, withBody bool) ([]Message, error) {
 	return out, rows.Err()
 }
 
-// SetFlags replaces the flag set of one message.
-func (s *Store) SetFlags(box string, uid uint64, flags []string) error {
-	_, err := s.db.Exec(`UPDATE messages SET flags = ? WHERE mailbox = ? AND uid = ?`,
-		joinFlags(flags), box, uid)
-	return err
+// FlagUpdate replaces the flags of one message as part of a batch.
+type FlagUpdate struct {
+	UID   uint64
+	Flags []string
+}
+
+// SetFlagsBatch replaces the flag sets of several messages in a single
+// transaction: every update commits or none do, so a write failing halfway
+// through a multi-message command cannot leave some flags changed and others
+// untouched.
+func (s *Store) SetFlagsBatch(box string, updates []FlagUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE messages SET flags = ? WHERE mailbox = ? AND uid = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, u := range updates {
+		if _, err := stmt.Exec(joinFlags(u.Flags), box, u.UID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Delete removes the given UIDs in a single transaction.

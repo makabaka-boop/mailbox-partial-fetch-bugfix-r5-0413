@@ -2,7 +2,6 @@ package imapd
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -252,52 +251,6 @@ func (s *Session) cmdUIDFetch(tag, args string) {
 	s.cmdDetailedFetch(tag, args)
 }
 
-func (s *Session) cmdUIDFetchLegacy(tag, args string) {
-	h, box := s.selected()
-	if h == nil {
-		s.sendf("%s BAD no mailbox selected", tag)
-		return
-	}
-	setSpec, items, ok := cutSpace(args)
-	if !ok || items == "" {
-		s.sendf("%s BAD invalid FETCH arguments", tag)
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	msgs, err := s.srv.store.List(box, true)
-	if err != nil {
-		s.sendf("%s NO storage error", tag)
-		return
-	}
-	set, err := parseUIDSet(setSpec, maxUID(msgs))
-	if err != nil {
-		s.sendf("%s BAD invalid UID set", tag)
-		return
-	}
-	wantBody := strings.Contains(strings.ToUpper(items), "BODY")
-	// Sequence numbers are computed here, under the hub lock, from the
-	// current UID ordering — never cached, so a renumbering caused by an
-	// EXPUNGE can never be confused with a message's identity.
-	for i, m := range msgs {
-		if !uidInSet(set, m.UID) {
-			continue
-		}
-		seq := i + 1
-		if wantBody {
-			var b bytes.Buffer
-			fmt.Fprintf(&b, "* %d FETCH (UID %d FLAGS (%s) BODY[] {%d}\r\n",
-				seq, m.UID, joinFlags(m.Flags), len(m.Body))
-			b.Write(m.Body)
-			b.WriteString(")\r\n")
-			s.enqueue(b.Bytes())
-		} else {
-			s.sendf("* %d FETCH (UID %d FLAGS (%s))", seq, m.UID, joinFlags(m.Flags))
-		}
-	}
-	s.sendf("%s OK FETCH completed", tag)
-}
-
 func (s *Session) cmdUIDStore(tag, args string) {
 	h, box := s.selected()
 	if h == nil {
@@ -351,18 +304,36 @@ func (s *Session) cmdUIDStore(tag, args string) {
 		s.sendf("%s BAD invalid UID set", tag)
 		return
 	}
-	var frames [][]byte
+	// Compute every new flag set before writing anything.
+	type planned struct {
+		seq      int
+		uid      uint64
+		newFlags []string
+	}
+	var plan []planned
 	for i, m := range msgs {
 		if !uidInSet(set, m.UID) {
 			continue
 		}
-		newFlags := applyFlagOp(m.Flags, flags, mode)
-		if err := s.srv.store.SetFlags(box, m.UID, newFlags); err != nil {
+		plan = append(plan, planned{i + 1, m.UID, applyFlagOp(m.Flags, flags, mode)})
+	}
+	// All flag writes share one transaction; a failure rolls every earlier
+	// update back and emits neither untagged data nor notifications, so the
+	// visible state and the broadcasts can never diverge.
+	if len(plan) > 0 {
+		updates := make([]FlagUpdate, len(plan))
+		for j, p := range plan {
+			updates[j] = FlagUpdate{UID: p.uid, Flags: p.newFlags}
+		}
+		if err := s.srv.store.SetFlagsBatch(box, updates); err != nil {
 			s.sendf("%s NO storage error", tag)
 			return
 		}
-		frames = append(frames, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS (%s))\r\n",
-			i+1, m.UID, joinFlags(newFlags))))
+	}
+	frames := make([][]byte, len(plan))
+	for j, p := range plan {
+		frames[j] = []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS (%s))\r\n",
+			p.seq, p.uid, joinFlags(p.newFlags)))
 	}
 	// One revision for the whole STORE; .SILENT suppresses the untagged
 	// responses only for the originator.
