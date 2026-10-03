@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -162,11 +163,53 @@ func (s *Store) List(box string, withBody bool) ([]Message, error) {
 	return out, rows.Err()
 }
 
-// SetFlags replaces the flag set of one message.
-func (s *Store) SetFlags(box string, uid uint64, flags []string) error {
-	_, err := s.db.Exec(`UPDATE messages SET flags = ? WHERE mailbox = ? AND uid = ?`,
-		joinFlags(flags), box, uid)
-	return err
+// FlagUpdate replaces the flag set of one message.
+type FlagUpdate struct {
+	UID   uint64
+	Flags []string
+}
+
+// setFlagsFault is a test-only fault-injection hook. When non-nil,
+// SetFlagsAll calls it before applying each update (with the count of
+// updates already applied) and aborts with the returned error, rolling the
+// whole transaction back.
+var (
+	faultMu       sync.Mutex
+	setFlagsFault func(applied int) error
+)
+
+// SetFlagsAll applies several flag replacements as one transaction: either
+// every update is persisted or none is, so a failure mid-way through a
+// multi-message command can never leave half-written flags behind.
+func (s *Store) SetFlagsAll(box string, updates []FlagUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	faultMu.Lock()
+	fault := setFlagsFault
+	faultMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE messages SET flags = ? WHERE mailbox = ? AND uid = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for i, u := range updates {
+		if fault != nil {
+			if err := fault(i); err != nil {
+				return err
+			}
+		}
+		if _, err := stmt.Exec(joinFlags(u.Flags), box, u.UID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Delete removes the given UIDs in a single transaction.

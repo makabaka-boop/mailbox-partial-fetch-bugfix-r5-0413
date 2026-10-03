@@ -2,7 +2,6 @@ package imapd
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -240,62 +239,12 @@ func (s *Session) cmdUID(tag, args string) {
 	}
 	switch strings.ToUpper(sub) {
 	case "FETCH":
-		s.cmdUIDFetch(tag, rest)
+		s.cmdFetch(tag, rest)
 	case "STORE":
 		s.cmdUIDStore(tag, rest)
 	default:
 		s.sendf("%s BAD unknown UID subcommand", tag)
 	}
-}
-
-func (s *Session) cmdUIDFetch(tag, args string) {
-	s.cmdDetailedFetch(tag, args)
-}
-
-func (s *Session) cmdUIDFetchLegacy(tag, args string) {
-	h, box := s.selected()
-	if h == nil {
-		s.sendf("%s BAD no mailbox selected", tag)
-		return
-	}
-	setSpec, items, ok := cutSpace(args)
-	if !ok || items == "" {
-		s.sendf("%s BAD invalid FETCH arguments", tag)
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	msgs, err := s.srv.store.List(box, true)
-	if err != nil {
-		s.sendf("%s NO storage error", tag)
-		return
-	}
-	set, err := parseUIDSet(setSpec, maxUID(msgs))
-	if err != nil {
-		s.sendf("%s BAD invalid UID set", tag)
-		return
-	}
-	wantBody := strings.Contains(strings.ToUpper(items), "BODY")
-	// Sequence numbers are computed here, under the hub lock, from the
-	// current UID ordering — never cached, so a renumbering caused by an
-	// EXPUNGE can never be confused with a message's identity.
-	for i, m := range msgs {
-		if !uidInSet(set, m.UID) {
-			continue
-		}
-		seq := i + 1
-		if wantBody {
-			var b bytes.Buffer
-			fmt.Fprintf(&b, "* %d FETCH (UID %d FLAGS (%s) BODY[] {%d}\r\n",
-				seq, m.UID, joinFlags(m.Flags), len(m.Body))
-			b.Write(m.Body)
-			b.WriteString(")\r\n")
-			s.enqueue(b.Bytes())
-		} else {
-			s.sendf("* %d FETCH (UID %d FLAGS (%s))", seq, m.UID, joinFlags(m.Flags))
-		}
-	}
-	s.sendf("%s OK FETCH completed", tag)
 }
 
 func (s *Session) cmdUIDStore(tag, args string) {
@@ -351,21 +300,24 @@ func (s *Session) cmdUIDStore(tag, args string) {
 		s.sendf("%s BAD invalid UID set", tag)
 		return
 	}
+	var updates []FlagUpdate
 	var frames [][]byte
 	for i, m := range msgs {
 		if !uidInSet(set, m.UID) {
 			continue
 		}
 		newFlags := applyFlagOp(m.Flags, flags, mode)
-		if err := s.srv.store.SetFlags(box, m.UID, newFlags); err != nil {
-			s.sendf("%s NO storage error", tag)
-			return
-		}
+		updates = append(updates, FlagUpdate{UID: m.UID, Flags: newFlags})
 		frames = append(frames, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS (%s))\r\n",
 			i+1, m.UID, joinFlags(newFlags))))
 	}
-	// One revision for the whole STORE; .SILENT suppresses the untagged
-	// responses only for the originator.
+	// One revision for the whole STORE, persisted atomically: a mid-way
+	// storage failure cannot leave half the messages updated. .SILENT
+	// suppresses the untagged responses only for the originator.
+	if err := s.srv.store.SetFlagsAll(box, updates); err != nil {
+		s.sendf("%s NO storage error", tag)
+		return
+	}
 	h.broadcast(s, silent, frames...)
 	s.sendf("%s OK STORE completed", tag)
 }

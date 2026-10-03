@@ -20,7 +20,7 @@ go test -race ./...        # 两个真实 TCP 客户端的交错测试
 |---|---|
 | `tag SELECT box` | 选中邮箱；返回 `* n EXISTS`、`* OK [UIDNEXT u]` |
 | `tag APPEND box [(flags)] {n}\r\n<n 字节>\r\n` | 追加消息；按声明字节数精确读取消息体 |
-| `tag UID FETCH set (FLAGS)` / `(BODY[])` | 按 UID 查询；返回 `* seq FETCH (UID u FLAGS (...) [BODY[] {n}...])` |
+| `tag UID FETCH set (item...)` | item ∈ `FLAGS`、`BODY[]`、`BODY.PEEK[]`，body 项可带 `<offset.count>` 字节片段；返回 `* seq FETCH (UID u FLAGS (...) [BODY[][<o>] {n}...])`，多个 body 项按请求顺序返回 |
 | `tag UID STORE set [+-]FLAGS[.SILENT] (flags)` | 替换/增加/移除标志；广播 `* seq FETCH (UID u FLAGS (...))` |
 | `tag EXPUNGE` | 删除所有 `\Deleted` 消息；每条广播 `* seq EXPUNGE` |
 | `tag NOOP` / `tag LOGOUT` | 空操作 / 断开（先 `* BYE`） |
@@ -44,6 +44,13 @@ UID 集合语法：`1,3,5:7,*`（`*` = 当前最大 UID，区间含端点、可�
   （含发起者；`.SILENT` 除外）。因此每个连接都按邮箱修订顺序收到
   `* n EXISTS` / `* seq FETCH` / `* seq EXPUNGE`。EXPUNGE 逐条生成事件，
   序号取该次删除瞬间的值（先删的先报，后续按已重排的序号）。
+- **取正文与已读状态**：`BODY[]` 把取到的邮件标记 `\Seen`，`BODY.PEEK[]`
+  不改变标记；`<o.c>` 按原始字节切片——多字节字符与二进制内容都按字节计，
+  起点越过正文末尾返回零字节、超出部分截断。整个 FETCH 的标记变化是一个
+  修订：先在单个事务里落库，发起者的 FETCH 响应里即带新标记，其余已选中
+  会话按修订次序各收一条 `* seq FETCH (UID u FLAGS (...))`；已带 `\Seen`
+  的邮件不再产生通知。非法字段或范围回 `BAD`，存储不变。UID STORE 的
+  多封标记更新同样在单个事务里，中途失败不留写了一半的标记。
 - **限制**：单封 16 KB（超限字面量会被读完并丢弃再回 `NO`，连接保持同步），
   每箱 200 封（`NO mailbox full`）。
 - **单写者连接**：每个会话一个写协程独占 socket 写，命令响应与异步通知都
@@ -57,3 +64,10 @@ UID 集合语法：`1,3,5:7,*`（`*` = 当前最大 UID，区间含端点、可�
 16 KB 超限、填满 200 封。全程逐行断言两个客户端收到的通知顺序、
 UID 查询结果（含重排后 `UID FETCH/STORE 2` 必须落空）、正文逐字节一致、
 以及 UID 不复用（最终 `UIDNEXT 204`）。
+
+`TestFetchBodyRangesAndSeenSync` 覆盖中文加二进制正文的字节级片段
+（含切断多字节字符的范围）、PEEK 不改标记、`BODY[]` 恰好一次置 `\Seen`
+并同步给另一会话、同一命令多个范围按序返回、越界返回零字节与截断、
+非法字段/范围回 `BAD` 且不动存储、EXPUNGE 重排后两端序号一致。
+`TestFetchFlagFailureIsAtomic` 用故障注入让多封邮件的标记写入中途失败，
+验证 FETCH 与 STORE 都整体回滚：无半截标记、两端无半截通知。

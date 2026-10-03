@@ -2,6 +2,8 @@ package imapd
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -145,6 +147,39 @@ func (c *testClient) expectFetchBody(wantHeaderPrefix, wantBody string) {
 }
 
 func (c *testClient) close() { c.conn.Close() }
+
+// expectBytes reads exactly len(want) bytes and requires an exact match. It
+// is used for FETCH responses carrying literals, where byte counts and raw
+// (possibly binary) payload must line up exactly.
+func (c *testClient) expectBytes(want []byte) {
+	c.t.Helper()
+	c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(c.br, got); err != nil {
+		c.t.Fatalf("%s: read frame: %v", c.name, err)
+	}
+	if !bytes.Equal(got, want) {
+		c.t.Fatalf("%s: frame mismatch:\ngot  %q\nwant %q", c.name, got, want)
+	}
+}
+
+// bodyPart is one expected BODY[] item of an untagged FETCH response.
+type bodyPart struct {
+	name string // e.g. "BODY[]" or "BODY[]<0>"
+	data []byte
+}
+
+// fetchFrame builds the expected wire bytes of one untagged FETCH response.
+func fetchFrame(seq, uid int, flags string, parts ...bodyPart) []byte {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "* %d FETCH (UID %d FLAGS (%s)", seq, uid, flags)
+	for _, p := range parts {
+		fmt.Fprintf(&b, " %s {%d}\r\n", p.name, len(p.data))
+		b.Write(p.data)
+	}
+	b.WriteString(")\r\n")
+	return b.Bytes()
+}
 
 // ---- the main scenario ----------------------------------------------------
 
@@ -390,6 +425,206 @@ func TestTwoClientsInterleaved(t *testing.T) {
 	d.expectLines("* 200 EXISTS", "* OK [UIDNEXT 204] next uid", tag+" OK SELECT completed")
 	tag = d.command("LOGOUT")
 	d.expectLines("* BYE imapd logging out", tag+" OK LOGOUT completed")
+}
+
+// ---- FETCH body ranges, PEEK and \Seen synchronization --------------------
+
+// TestFetchBodyRangesAndSeenSync covers byte-exact partial fetches over
+// multi-byte/binary content, PEEK vs. BODY[] \Seen semantics, multiple
+// ranges in one command, ranges past the end of the body, invalid
+// arguments, and the propagation of the resulting flag change to the other
+// selected session in mailbox revision order.
+func TestFetchBodyRangesAndSeenSync(t *testing.T) {
+	_, addr := startTestServer(t)
+
+	a := newTestClient(t, "A", addr)
+	defer a.close()
+	b := newTestClient(t, "B", addr)
+	defer b.close()
+
+	tag := a.command("SELECT INBOX")
+	a.expectLines("* 0 EXISTS", "* OK [UIDNEXT 1] next uid", tag+" OK SELECT completed")
+	tag = b.command("SELECT INBOX")
+	b.expectLines("* 0 EXISTS", "* OK [UIDNEXT 1] next uid", tag+" OK SELECT completed")
+
+	// One message mixing multi-byte UTF-8 (Chinese) and binary bytes:
+	// 你好世界 = 12 bytes, then 4 binary bytes, then "tail" = 4 bytes.
+	body := "你好世界" + string([]byte{0x00, 0xff, 0xfe, 0x01}) + "tail"
+	raw := []byte(body)
+	if len(raw) != 20 {
+		t.Fatalf("test body length: %d", len(raw))
+	}
+	tag = a.appendMsg("INBOX", "", body)
+	a.expectLines(exists(1), appendOK(tag, 1))
+	b.expectLines(exists(1))
+
+	// Invalid items, ranges and UID sets are rejected and change nothing.
+	for _, tc := range []struct{ cmd, reply string }{
+		{"UID FETCH 1", " BAD invalid FETCH"},
+		{"UID FETCH 1 ()", " BAD invalid FETCH items"},
+		{"UID FETCH 1 (WAT)", " BAD invalid FETCH items"},
+		{"UID FETCH 1 (BODY[HEADER])", " BAD invalid FETCH items"},
+		{"UID FETCH 1 (BODY[]<x.2>)", " BAD invalid FETCH items"},
+		{"UID FETCH 1 (BODY[]<1.2)", " BAD invalid FETCH items"},
+		{"UID FETCH 1 (BODY[]<99999999999999999999999.1>)", " BAD invalid FETCH items"},
+		{"UID FETCH 0 (BODY[])", " BAD invalid UID set"},
+		{"UID FETCH 1: (FLAGS)", " BAD invalid UID set"},
+	} {
+		tag = a.command("%s", tc.cmd)
+		a.expectLines(tag + tc.reply)
+	}
+	// Nothing was marked: the failed commands left the store untouched.
+	tag = a.command("UID FETCH 1 (FLAGS)")
+	a.expectLines(`* 1 FETCH (UID 1 FLAGS ())`, tag+" OK FETCH completed")
+
+	// PEEK returns exact raw bytes — here a range splitting a multi-byte
+	// character — and never touches \Seen.
+	tag = a.command("UID FETCH 1 (BODY.PEEK[]<0.4>)")
+	a.expectBytes(fetchFrame(1, 1, "", bodyPart{"BODY[]<0>", raw[0:4]}))
+	a.expectLines(tag + " OK FETCH completed")
+	tag = a.command("UID FETCH 1 (FLAGS)")
+	a.expectLines(`* 1 FETCH (UID 1 FLAGS ())`, tag+" OK FETCH completed")
+	// B received nothing (its NOOP reply must be the very next line).
+	tag = b.command("NOOP")
+	b.expectLines(tag + " OK NOOP completed")
+
+	// Multiple ranges in one command come back in request order; a range
+	// starting past the end of the body yields zero bytes. The non-PEEK
+	// item marks the message \Seen exactly once.
+	tag = a.command("UID FETCH 1 (BODY.PEEK[]<0.6> BODY[]<12.4> BODY[]<50.10>)")
+	a.expectBytes(fetchFrame(1, 1, `\Seen`,
+		bodyPart{"BODY[]<0>", raw[0:6]},
+		bodyPart{"BODY[]<12>", raw[12:16]},
+		bodyPart{"BODY[]<50>", nil},
+	))
+	a.expectLines(tag + " OK FETCH completed")
+	// B learns about the single \Seen change in revision order.
+	b.expectLines(`* 1 FETCH (UID 1 FLAGS (\Seen))`)
+
+	// A range running past the end is truncated to the remaining bytes.
+	tag = a.command("UID FETCH 1 (BODY.PEEK[]<16.100>)")
+	a.expectBytes(fetchFrame(1, 1, `\Seen`, bodyPart{"BODY[]<16>", raw[16:20]}))
+	a.expectLines(tag + " OK FETCH completed")
+
+	// The message is already \Seen: re-reading it (PEEK or not) produces no
+	// further change and no further notification.
+	tag = a.command("UID FETCH 1 (BODY[])")
+	a.expectBytes(fetchFrame(1, 1, `\Seen`, bodyPart{"BODY[]", raw}))
+	a.expectLines(tag + " OK FETCH completed")
+	tag = b.command("NOOP")
+	b.expectLines(tag + " OK NOOP completed")
+
+	// B reads a byte range of a new message; A observes the \Seen change.
+	tag = a.appendMsg("INBOX", "", "second-message")
+	a.expectLines(exists(2), appendOK(tag, 2))
+	b.expectLines(exists(2))
+	tag = b.command("UID FETCH 2 (BODY[]<0.4>)")
+	b.expectBytes(fetchFrame(2, 2, `\Seen`, bodyPart{"BODY[]<0>", []byte("seco")}))
+	b.expectLines(tag + " OK FETCH completed")
+	a.expectLines(`* 2 FETCH (UID 2 FLAGS (\Seen))`)
+
+	// Expunge the first message: sequence numbers shift and both sides use
+	// the renumbered positions for everything that follows.
+	tag = a.command(`UID STORE 1 +FLAGS (\Deleted)`)
+	a.expectLines(`* 1 FETCH (UID 1 FLAGS (\Deleted \Seen))`, tag+" OK STORE completed")
+	b.expectLines(`* 1 FETCH (UID 1 FLAGS (\Deleted \Seen))`)
+	tag = a.command("EXPUNGE")
+	a.expectLines("* 1 EXPUNGE", tag+" OK EXPUNGE completed")
+	b.expectLines("* 1 EXPUNGE")
+	// State: uid2(\Seen)=seq1.
+
+	tag = a.appendMsg("INBOX", "", "third")
+	a.expectLines(exists(2), appendOK(tag, 3))
+	b.expectLines(exists(2))
+	tag = a.appendMsg("INBOX", "", "fourth")
+	a.expectLines(exists(3), appendOK(tag, 4))
+	b.expectLines(exists(3))
+	// State: uid2(\Seen)=seq1, uid3()=seq2, uid4()=seq3.
+
+	// One command, several messages, two body items each: every part comes
+	// back in request order, and B gets one notice per message whose flags
+	// actually changed — already-seen messages produce none.
+	tag = a.command("UID FETCH 2:4 (BODY.PEEK[]<0.1> BODY[]<0.1>)")
+	a.expectBytes(fetchFrame(1, 2, `\Seen`,
+		bodyPart{"BODY[]<0>", []byte("s")}, bodyPart{"BODY[]<0>", []byte("s")}))
+	a.expectBytes(fetchFrame(2, 3, `\Seen`,
+		bodyPart{"BODY[]<0>", []byte("t")}, bodyPart{"BODY[]<0>", []byte("t")}))
+	a.expectBytes(fetchFrame(3, 4, `\Seen`,
+		bodyPart{"BODY[]<0>", []byte("f")}, bodyPart{"BODY[]<0>", []byte("f")}))
+	a.expectLines(tag + " OK FETCH completed")
+	b.expectLines(
+		`* 2 FETCH (UID 3 FLAGS (\Seen))`,
+		`* 3 FETCH (UID 4 FLAGS (\Seen))`,
+	)
+	tag = b.command("NOOP")
+	b.expectLines(tag + " OK NOOP completed")
+}
+
+// TestFetchFlagFailureIsAtomic forces the flag update to fail part-way
+// through multi-message FETCH and STORE commands and verifies that nothing
+// is persisted and nothing is notified: each command is one revision or
+// none at all.
+func TestFetchFlagFailureIsAtomic(t *testing.T) {
+	_, addr := startTestServer(t)
+
+	a := newTestClient(t, "A", addr)
+	defer a.close()
+	b := newTestClient(t, "B", addr)
+	defer b.close()
+
+	tag := a.command("SELECT INBOX")
+	a.expectLines("* 0 EXISTS", "* OK [UIDNEXT 1] next uid", tag+" OK SELECT completed")
+	tag = b.command("SELECT INBOX")
+	b.expectLines("* 0 EXISTS", "* OK [UIDNEXT 1] next uid", tag+" OK SELECT completed")
+
+	tag = a.appendMsg("INBOX", "", "one")
+	a.expectLines(exists(1), appendOK(tag, 1))
+	b.expectLines(exists(1))
+	tag = a.appendMsg("INBOX", "", "two")
+	a.expectLines(exists(2), appendOK(tag, 2))
+	b.expectLines(exists(2))
+
+	injectFault := func(f func(applied int) error) {
+		faultMu.Lock()
+		setFlagsFault = f
+		faultMu.Unlock()
+	}
+	// Fail the second flag update of each command; the first update must
+	// roll back with it.
+	injectFault(func(applied int) error {
+		if applied == 1 {
+			return errors.New("injected failure")
+		}
+		return nil
+	})
+	defer injectFault(nil)
+
+	tag = a.command("UID FETCH 1:2 (BODY[])")
+	a.expectLines(tag + " NO storage error")
+	tag = a.command(`UID STORE 1:2 +FLAGS (\Draft)`)
+	a.expectLines(tag + " NO storage error")
+
+	// No half-applied flags and no notifications on either connection.
+	tag = a.command("UID FETCH 1:2 (FLAGS)")
+	a.expectLines(
+		`* 1 FETCH (UID 1 FLAGS ())`,
+		`* 2 FETCH (UID 2 FLAGS ())`,
+		tag+" OK FETCH completed",
+	)
+	tag = b.command("NOOP")
+	b.expectLines(tag + " OK NOOP completed")
+
+	// With the fault cleared, the same FETCH succeeds as a single revision:
+	// A gets both bodies with the new flags, B gets both updates in order.
+	injectFault(nil)
+	tag = a.command("UID FETCH 1:2 (BODY[])")
+	a.expectBytes(fetchFrame(1, 1, `\Seen`, bodyPart{"BODY[]", []byte("one")}))
+	a.expectBytes(fetchFrame(2, 2, `\Seen`, bodyPart{"BODY[]", []byte("two")}))
+	a.expectLines(tag + " OK FETCH completed")
+	b.expectLines(
+		`* 1 FETCH (UID 1 FLAGS (\Seen))`,
+		`* 2 FETCH (UID 2 FLAGS (\Seen))`,
+	)
 }
 
 // ---- parser unit tests ----------------------------------------------------
